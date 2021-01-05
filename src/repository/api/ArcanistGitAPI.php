@@ -20,12 +20,11 @@ final class ArcanistGitAPI extends ArcanistRepositoryAPI {
   protected function buildLocalFuture(array $argv) {
     $argv[0] = 'git '.$argv[0];
 
-    $future = newv('ExecFuture', $argv);
-    $future->setCWD($this->getPath());
-    return $future;
+    return newv('ExecFuture', $argv)
+      ->setCWD($this->getPath());
   }
 
-  public function execPassthru($pattern /* , ... */) {
+  public function newPassthru($pattern /* , ... */) {
     $args = func_get_args();
 
     static $git = null;
@@ -43,9 +42,9 @@ final class ArcanistGitAPI extends ArcanistRepositoryAPI {
 
     $args[0] = $git.' '.$args[0];
 
-    return call_user_func_array('phutil_passthru', $args);
+    return newv('PhutilExecPassthru', $args)
+      ->setCWD($this->getPath());
   }
-
 
   public function getSourceControlSystemName() {
     return 'git';
@@ -554,27 +553,7 @@ final class ArcanistGitAPI extends ArcanistRepositoryAPI {
       }
     }
 
-    // "git ls-remote --get-url" is the appropriate plumbing to get the remote
-    // URI. "git config remote.origin.url", on the other hand, may not be as
-    // accurate (for example, it does not take into account possible URL
-    // rewriting rules set by the user through "url.<base>.insteadOf"). However,
-    // the --get-url flag requires git 1.7.5.
-    $version = $this->getGitVersion();
-    if (version_compare($version, '1.7.5', '>=')) {
-      list($stdout) = $this->execxLocal('ls-remote --get-url %s', $remote);
-    } else {
-      list($stdout) = $this->execxLocal('config %s', "remote.{$remote}.url");
-    }
-
-    $uri = rtrim($stdout);
-    // ls-remote echos the remote name (ie 'origin') if no remote URI is found
-    // TODO: In 2.7.0 (circa 2016) git introduced `git remote get-url`
-    // with saner error handling.
-    if (!$uri || $uri === $remote) {
-      return null;
-    }
-
-    return $uri;
+    return $this->getGitRemoteFetchURI($remote);
   }
 
   public function getSourceControlPath() {
@@ -618,16 +597,16 @@ final class ArcanistGitAPI extends ArcanistRepositoryAPI {
 
   public function getCanonicalRevisionName($string) {
     $match = null;
+
     if (preg_match('/@([0-9]+)$/', $string, $match)) {
       $stdout = $this->getHashFromFromSVNRevisionNumber($match[1]);
     } else {
       list($stdout) = $this->execxLocal(
-        phutil_is_windows()
-        ? 'show -s --format=%C %s --'
-        : 'show -s --format=%s %s --',
+        'show -s --format=%s %s --',
         '%H',
         $string);
     }
+
     return rtrim($stdout);
   }
 
@@ -1077,7 +1056,7 @@ final class ArcanistGitAPI extends ArcanistRepositoryAPI {
    *
    * @return list<dict<string, string>> Dictionary of branch information.
    */
-  public function getAllBranches() {
+  private function getAllBranches() {
     $field_list = array(
       '%(refname)',
       '%(objectname)',
@@ -1110,6 +1089,7 @@ final class ArcanistGitAPI extends ArcanistRepositoryAPI {
         $result[] = array(
           'current' => ($branch === $current),
           'name' => $branch,
+          'ref' => $ref,
           'hash' => $hash,
           'tree' => $tree,
           'epoch' => (int)$epoch,
@@ -1122,17 +1102,25 @@ final class ArcanistGitAPI extends ArcanistRepositoryAPI {
     return $result;
   }
 
+  public function getBaseCommitRef() {
+    $base_commit = $this->getBaseCommit();
+
+    if ($base_commit === self::GIT_MAGIC_ROOT_COMMIT) {
+      return null;
+    }
+
+    $base_message = $this->getCommitMessage($base_commit);
+
+    // TODO: We should also pull the tree hash.
+
+    return $this->newCommitRef()
+      ->setCommitHash($base_commit)
+      ->attachMessage($base_message);
+  }
+
   public function getWorkingCopyRevision() {
     list($stdout) = $this->execxLocal('rev-parse HEAD');
     return rtrim($stdout, "\n");
-  }
-
-  public function getUnderlyingWorkingCopyRevision() {
-    list($err, $stdout) = $this->execManualLocal('svn find-rev HEAD');
-    if (!$err && $stdout) {
-      return rtrim($stdout, "\n");
-    }
-    return $this->getWorkingCopyRevision();
   }
 
   public function isHistoryDefaultImmutable() {
@@ -1169,26 +1157,6 @@ final class ArcanistGitAPI extends ArcanistRepositoryAPI {
     }
     $parser = new ArcanistDiffParser();
     return $parser->parseDiff($diff);
-  }
-
-  public function supportsLocalBranchMerge() {
-    return true;
-  }
-
-  public function performLocalBranchMerge($branch, $message) {
-    if (!$branch) {
-      throw new ArcanistUsageException(
-        pht('Under git, you must specify the branch you want to merge.'));
-    }
-    $err = phutil_passthru(
-      '(cd %s && git merge --no-ff -m %s %s)',
-      $this->getPath(),
-      $message,
-      $branch);
-
-    if ($err) {
-      throw new ArcanistUsageException(pht('Merge failed!'));
-    }
   }
 
   public function getFinalizedRevisionMessage() {
@@ -1286,19 +1254,6 @@ final class ArcanistGitAPI extends ArcanistRepositoryAPI {
       $commit);
 
     return trim($summary);
-  }
-
-  public function backoutCommit($commit_hash) {
-    $this->execxLocal('revert %s -n --no-edit', $commit_hash);
-    $this->reloadWorkingCopy();
-    if (!$this->getUncommittedStatus()) {
-      throw new ArcanistUsageException(
-        pht('%s has already been reverted.', $commit_hash));
-    }
-  }
-
-  public function getBackoutMessage($commit_hash) {
-    return pht('This reverts commit %s.', $commit_hash);
   }
 
   public function isGitSubversionRepo() {
@@ -1583,10 +1538,286 @@ final class ArcanistGitAPI extends ArcanistRepositoryAPI {
   }
 
   public function isPushableRemote($remote_name) {
+    $uri = $this->getGitRemotePushURI($remote_name);
+    return ($uri !== null);
+  }
+
+  public function isFetchableRemote($remote_name) {
+    $uri = $this->getGitRemoteFetchURI($remote_name);
+    return ($uri !== null);
+  }
+
+  private function getGitRemoteFetchURI($remote_name) {
+    return $this->getGitRemoteURI($remote_name, $for_push = false);
+  }
+
+  private function getGitRemotePushURI($remote_name) {
+    return $this->getGitRemoteURI($remote_name, $for_push = true);
+  }
+
+  private function getGitRemoteURI($remote_name, $for_push) {
+    $remote_uri = $this->loadGitRemoteURI($remote_name, $for_push);
+
+    if ($remote_uri !== null) {
+      $remote_uri = rtrim($remote_uri);
+      if (!strlen($remote_uri)) {
+        $remote_uri = null;
+      }
+    }
+
+    return $remote_uri;
+  }
+
+  private function loadGitRemoteURI($remote_name, $for_push) {
+    // Try to identify the best URI for a given remote. This is complicated
+    // because remotes may have different "push" and "fetch" URIs, may
+    // rewrite URIs with "insteadOf" configuration, and different versions
+    // of Git support different URI resolution commands.
+
+    // Remotes may also have more than one URI of a given type, but we ignore
+    // those cases here.
+
+    // Start with "git remote get-url [--push]". This is the simplest and
+    // most accurate command, but was introduced most recently in Git's
+    // history.
+
+    $argv = array();
+    if ($for_push) {
+      $argv[] = '--push';
+    }
+
     list($err, $stdout) = $this->execManualLocal(
-      'remote get-url --push -- %s',
+      'remote get-url %Ls -- %s',
+      $argv,
       $remote_name);
-    return !$err;
+    if (!$err) {
+      return $stdout;
+    }
+
+    // See T13481. If "git remote get-url [--push]" failed, it might be because
+    // the remote does not exist, but it might also be because the version of
+    // Git is too old to support "git remote get-url", which was introduced
+    // in Git 2.7 (circa late 2015).
+
+    $git_version = $this->getGitVersion();
+    if (version_compare($git_version, '2.7', '>=')) {
+      // This version of Git should support "git remote get-url --push", but
+      // the command failed, so conclude this is not a valid remote and thus
+      // there is no remote URI.
+      return null;
+    }
+
+    // If we arrive here, we're in a version of Git which is too old to
+    // support "git remote get-url [--push]". We're going to fall back to
+    // older and less accurate mechanisms for figuring out the remote URI.
+
+    // The first mechanism we try is "git ls-remote --get-url". This exists
+    // in Git 1.7.5 or newer. It only gives us the fetch URI, so this result
+    // will be incorrect if a remote has different fetch and push URIs.
+    // However, this is very rare, and this result is almost always correct.
+
+    // Note that some old versions of Git do not parse "--" in this command
+    // properly. We omit it since it doesn't seem like there's anything
+    // dangerous an attacker can do even if they can choose a remote name to
+    // intentionally cause an argument misparse.
+
+    // This will cause the command to behave incorrectly for remotes with
+    // names which are also valid flags, like "--quiet".
+
+    list($err, $stdout) = $this->execManualLocal(
+      'ls-remote --get-url %s',
+      $remote_name);
+    if (!$err) {
+      // The "git ls-remote --get-url" command just echoes the remote name
+      // (like "origin") if no remote URI is found. Treat this like a failure.
+      $output_is_input = (rtrim($stdout) === $remote_name);
+      if (!$output_is_input) {
+        return $stdout;
+      }
+    }
+
+    if (version_compare($git_version, '1.7.5', '>=')) {
+      // This version of Git should support "git ls-remote --get-url", but
+      // the command failed (or echoed the input), so conclude the remote
+      // really does not exist.
+      return null;
+    }
+
+    // Fall back to the very old "git config -- remote.origin.url" command.
+    // This does not give us push URLs and does not resolve "insteadOf"
+    // aliases, but still works in the simplest (and most common) cases.
+
+    list($err, $stdout) = $this->execManualLocal(
+      'config -- %s',
+      sprintf('remote.%s.url', $remote_name));
+    if (!$err) {
+      return $stdout;
+    }
+
+    return null;
+  }
+
+  protected function newCurrentCommitSymbol() {
+    return 'HEAD';
+  }
+
+  public function isGitLFSWorkingCopy() {
+
+    // We're going to run:
+    //
+    //   $ git ls-files -z -- ':(attr:filter=lfs)'
+    //
+    // ...and exit as soon as it generates any field terminated with a "\0".
+    //
+    // If this command generates any such output, that means this working copy
+    // contains at least one LFS file, so it's an LFS working copy. If it
+    // exits with no error and no output, this is not an LFS working copy.
+    //
+    // If it exits with an error, we're in trouble.
+
+    $future = $this->buildLocalFuture(
+      array(
+        'ls-files -z -- %s',
+        ':(attr:filter=lfs)',
+      ));
+
+    $lfs_list = id(new LinesOfALargeExecFuture($future))
+      ->setDelimiter("\0");
+
+    try {
+      foreach ($lfs_list as $lfs_file) {
+        // We have our answer, so we can throw the subprocess away.
+        $future->resolveKill();
+        return true;
+      }
+      return false;
+    } catch (CommandException $ex) {
+      // This is probably an older version of Git. Continue below.
+    }
+
+    // In older versions of Git, the first command will fail with an error
+    // ("Invalid pathspec magic..."). See PHI1718.
+    //
+    // Some other tests we could use include:
+    //
+    // (1) Look for ".gitattributes" at the repository root. This approach is
+    // a rough approximation because ".gitattributes" may be global or in a
+    // subdirectory. See D21190.
+    //
+    // (2) Use "git check-attr" and pipe a bunch of files into it, roughly
+    // like this:
+    //
+    //   $ git ls-files -z -- | git check-attr --stdin -z filter --
+    //
+    // However, the best version of this check I could come up with is fairly
+    // slow in even moderately large repositories (~200ms in a repository with
+    // 10K paths). See D21190.
+    //
+    // (3) Use "git lfs ls-files". This is even worse than piping "ls-files"
+    // to "check-attr" in PHP (~600ms in a repository with 10K paths).
+    //
+    // (4) Give up and just assume the repository isn't LFS. This is the
+    // current behavior.
+
+    return false;
+  }
+
+  protected function newLandEngine() {
+    return new ArcanistGitLandEngine();
+  }
+
+  protected function newWorkEngine() {
+    return new ArcanistGitWorkEngine();
+  }
+
+  public function newLocalState() {
+    return id(new ArcanistGitLocalState())
+      ->setRepositoryAPI($this);
+  }
+
+  public function readRawCommit($hash) {
+    list($stdout) = $this->execxLocal(
+      'cat-file commit -- %s',
+      $hash);
+
+    return ArcanistGitRawCommit::newFromRawBlob($stdout);
+  }
+
+  public function writeRawCommit(ArcanistGitRawCommit $commit) {
+    $blob = $commit->getRawBlob();
+
+    $future = $this->execFutureLocal('hash-object -t commit --stdin -w');
+    $future->write($blob);
+    list($stdout) = $future->resolvex();
+
+    return trim($stdout);
+  }
+
+  protected function newSupportedMarkerTypes() {
+    return array(
+      ArcanistMarkerRef::TYPE_BRANCH,
+    );
+  }
+
+  protected function newMarkerRefQueryTemplate() {
+    return new ArcanistGitRepositoryMarkerQuery();
+  }
+
+  protected function newRemoteRefQueryTemplate() {
+    return new ArcanistGitRepositoryRemoteQuery();
+  }
+
+  protected function newNormalizedURI($uri) {
+    return new ArcanistRepositoryURINormalizer(
+      ArcanistRepositoryURINormalizer::TYPE_GIT,
+      $uri);
+  }
+
+  protected function newPublishedCommitHashes() {
+    $remotes = $this->newRemoteRefQuery()
+      ->execute();
+    if (!$remotes) {
+      return array();
+    }
+
+    $markers = $this->newMarkerRefQuery()
+      ->withIsRemoteCache(true)
+      ->execute();
+
+    if (!$markers) {
+      return array();
+    }
+
+    $runtime = $this->getRuntime();
+    $workflow = $runtime->getCurrentWorkflow();
+
+    $workflow->loadHardpoints(
+      $remotes,
+      ArcanistRemoteRef::HARDPOINT_REPOSITORYREFS);
+
+    $remotes = mpull($remotes, null, 'getRemoteName');
+
+    $hashes = array();
+
+    foreach ($markers as $marker) {
+      $remote_name = $marker->getRemoteName();
+      $remote = idx($remotes, $remote_name);
+      if (!$remote) {
+        continue;
+      }
+
+      if (!$remote->isPermanentRef($marker)) {
+        continue;
+      }
+
+      $hashes[] = $marker->getCommitHash();
+    }
+
+    return $hashes;
+  }
+
+  protected function newCommitGraphQueryTemplate() {
+    return new ArcanistGitCommitGraphQuery();
   }
 
 }
